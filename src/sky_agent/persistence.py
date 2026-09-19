@@ -72,6 +72,8 @@ def inspect_run(directory: Path) -> dict:
             raise ValueError(f"Corrupt journal at line {index + 1}") from None
     calls = {}
     messages = []
+    hooks = []
+    cleanup_errors = []
     status = "unknown"
     for index, event in enumerate(events):
         try:
@@ -91,7 +93,11 @@ def inspect_run(directory: Path) -> dict:
                 messages.append(event["message"])
             elif event["kind"] == "session_finished":
                 status = event["status"]
+                cleanup_errors = event.get("cleanup_errors", [])
+            elif event["kind"] in {"hook_started", "hook_finished", "hook_failed"}:
+                hooks.append(event)
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"Invalid journal record at line {index + 1}: {exc}") from exc
     return {"directory": str(directory.resolve()), "status": status,
-            "incomplete_tail": incomplete_tail, "calls": calls, "messages": messages}
+            "incomplete_tail": incomplete_tail, "calls": calls, "messages": messages,
+            "hooks": hooks, "cleanup_errors": cleanup_errors}

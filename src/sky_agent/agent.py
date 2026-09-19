@@ -3,8 +3,8 @@ from pathlib import Path
 import threading
 from typing import Any, Callable, Protocol
 
-from .execution import ExecutionContext, ToolError
-from .hooks import BeforeToolHook
+from .execution import ExecutionContext
+from .lifecycle import RunLifecycle
 from .permissions import PermissionPolicy
 from .persistence import RunStore
 from .runtime import ToolRunner
@@ -36,7 +36,7 @@ class Agent:
     def __init__(self, model: Model, tools: list[Tool], *, max_steps: int = 20,
                  workspace: Path | None = None, max_parallel: int = 4,
                  policy: PermissionPolicy | None = None,
-                 hooks: tuple[BeforeToolHook, ...] = (),
+                 hooks: tuple[object, ...] = (),
                  on_event: Callable[[dict], None] | None = None):
         if max_steps < 1:
             raise ValueError("max_steps must be positive")
@@ -60,6 +60,22 @@ class Agent:
         self.hooks = tuple(hooks)
         self.on_event = on_event
         self.last_session_directory: Path | None = None
+        self._active_context: ExecutionContext | None = None
+        self._active_lock = threading.Lock()
+
+    def request_stop(self) -> bool:
+        """Request cooperative shutdown of the active run.
+
+        The call is idempotent and returns whether a run was active. The model
+        and trusted callbacks must return; tool subprocesses are then drained
+        and stopped by the normal runtime cleanup path.
+        """
+        with self._active_lock:
+            context = self._active_context
+            if context is None:
+                return False
+            context.cancel.set()
+            return True
 
     def run(self, task: str, *, cancel: threading.Event | None = None) -> AgentResult:
         if not task.strip():
@@ -68,19 +84,16 @@ class Agent:
             store = RunStore(self.workspace)
             self.last_session_directory = store.directory
             context = ExecutionContext(store, cancel if cancel is not None else threading.Event(), self.on_event)
-            context.emit("session_started", directory=str(store.directory))
+            with self._active_lock:
+                self._active_context = context
             try:
-                result = self._run(task, context)
-            except BaseException as exc:
-                context.cancel.set()
-                status = "cancelled" if isinstance(exc, KeyboardInterrupt) or (
-                    isinstance(exc, ToolError) and exc.code == "cancelled") else "failed"
-                context.emit("session_finished", status=status, error=type(exc).__name__)
-                raise
-            context.emit("session_finished", status="completed")
-            return result
+                with RunLifecycle(context, self.hooks).session(task) as lifecycle:
+                    return self._run(task, context, lifecycle)
+            finally:
+                with self._active_lock:
+                    self._active_context = None
 
-    def _run(self, task: str, context: ExecutionContext) -> AgentResult:
+    def _run(self, task: str, context: ExecutionContext, lifecycle: RunLifecycle) -> AgentResult:
         messages: list[Message] = [
             {"role": "system", "content": (
                 "You are a coding agent working in a local workspace. Inspect relevant "
@@ -97,13 +110,12 @@ class Agent:
         for message in messages:
             context.store.record("message", message=message)
         runner = ToolRunner(list(self.tools.values()), context, max_parallel=self.max_parallel,
-                            policy=self.policy, hooks=self.hooks)
+                            policy=self.policy, hooks=self.hooks, lifecycle=lifecycle.hooks)
         schemas = [tool.schema for tool in self.tools.values()]
         for step in range(1, self.max_steps + 1):
             context.check_cancelled()
-            response = self.model.complete(messages, schemas)
+            response = lifecycle.complete(self.model, messages, schemas, step)
             messages.append(response)
-            context.store.record("message", message=response)
             calls = response.get("tool_calls") or []
             if not calls:
                 context.check_cancelled()

@@ -4,7 +4,7 @@ import json
 import time
 
 from .execution import ExecutionContext, ToolError
-from .hooks import BeforeToolHook, ToolRequest, conversation_snapshot
+from .hooks import HookManager, ToolRequest, conversation_snapshot
 from .permissions import PermissionPolicy
 from .persistence import PersistenceError
 from .tools import Tool
@@ -16,7 +16,8 @@ class ProtocolError(ValueError):
 
 class ToolRunner:
     def __init__(self, tools: list[Tool], context: ExecutionContext, *, max_parallel: int = 4,
-                 policy: PermissionPolicy | None = None, hooks: tuple[BeforeToolHook, ...] = ()):
+                 policy: PermissionPolicy | None = None, hooks: tuple[object, ...] = (),
+                 lifecycle: HookManager | None = None):
         if not 1 <= max_parallel <= 32:
             raise ValueError("max_parallel must be between 1 and 32")
         self.tools = {tool.name: tool for tool in tools}
@@ -26,6 +27,7 @@ class ToolRunner:
         self.max_parallel = max_parallel
         self.policy = policy or PermissionPolicy()
         self.hooks = tuple(hooks)
+        self.lifecycle = lifecycle or HookManager(self.hooks)
 
     @property
     def policy(self):
@@ -37,17 +39,8 @@ class ToolRunner:
         self._permission_hook = policy.new_session()
 
     def before_tool(self, request, context):
-        for hook in (self._permission_hook, *self.hooks):
-            context.check_cancelled()
-            try:
-                if hook.before_tool(request, context) is not None:
-                    raise TypeError("Before-tool hooks must return None or raise ToolError")
-            except (ToolError, PersistenceError):
-                raise
-            except Exception as exc:
-                context.emit("hook_failed", hook=type(hook).__name__, error=type(exc).__name__,
-                             fingerprint=request.fingerprint)
-                raise ToolError("hook_failed", "A before-tool hook failed; execution denied") from exc
+        decision = self.lifecycle.before_tool(request, context)
+        self._permission_hook.before_tool(request, context, decision)
 
     def validate_calls(self, calls: list[dict]):
         if not isinstance(calls, list) or len(calls) > 128:
@@ -87,6 +80,7 @@ class ToolRunner:
         context = replace(self.context, invocation_id=f"{round_number}:{call['id']}",
                           tool_call_id=call["id"], tool=name)
         started = time.monotonic()
+        request = None
         context.emit("started", arguments=call["function"]["arguments"])
         try:
             context.check_cancelled()
@@ -111,8 +105,20 @@ class ToolRunner:
         status = "completed" if result["ok"] else (
             "cancelled" if result["error"]["code"] == "cancelled" else "failed")
         context.emit("finished", result=result, status=status, duration=time.monotonic() - started)
+        if not result["ok"]:
+            self.lifecycle.observers("tool_error", context,
+                                     request=self.request_data(request), result=result, status=status)
+        self.lifecycle.observers("after_tool", context, request=self.request_data(request),
+                                 result=result, status=status)
         return {"role": "tool", "tool_call_id": call["id"],
                 "content": json.dumps(result, ensure_ascii=False)}
+
+    @staticmethod
+    def request_data(request):
+        if request is None:
+            return None
+        return {"tool_name": request.tool_name, "arguments": request.arguments,
+                "fingerprint": request.fingerprint, "workspace": request.workspace}
 
     def run(self, calls, *, round_number: int, messages: list[dict] | None = None):
         self.validate_calls(calls)

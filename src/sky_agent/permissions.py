@@ -4,7 +4,7 @@ import time
 from typing import Callable, Protocol
 
 from .execution import ExecutionContext, ToolError
-from .hooks import ToolRequest
+from .hooks import HookDecision, ToolRequest
 from .persistence import PersistenceError
 
 PERMISSION_MODES = ("allow", "default", "acceptEdits", "auto", "readOnly")
@@ -85,14 +85,20 @@ class PermissionHook:
         return ("allow" if approved else "deny"), "human", (
             "Approved for this exact call" if approved else "Approval declined or unavailable")
 
-    def _decide(self, request, context):
+    def _decide(self, request, context, hook_decision):
         policy = self.policy
         if request.tool_name in policy.denied:
             return "deny", "deny_rule", "Tool is explicitly denied"
         if (policy.read_only or policy.mode == "readOnly") and not request.read_only:
             return "deny", "read_only", "Read-only policy denies this tool"
-        if request.tool_name in policy.ask:
-            return self._ask(request, context, "ask_rule", "Explicit rule requires human approval")
+        if hook_decision.decision == "deny":
+            return "deny", "hook", hook_decision.reason or "Hook denied this tool"
+        if request.tool_name in policy.ask or hook_decision.decision == "ask":
+            source = "ask_rule" if request.tool_name in policy.ask else "hook"
+            reason = "Explicit rule requires human approval" if source == "ask_rule" else "Hook requires human approval"
+            if hook_decision.reason:
+                reason += ": " + hook_decision.reason
+            return self._ask(request, context, source, reason)
         if request.tool_name in policy.allowed:
             return "allow", "allow_rule", "Tool is explicitly allowed"
         if policy.mode == "allow":
@@ -136,13 +142,14 @@ class PermissionHook:
             return self._ask(request, context, "classifier", result.reason)
         return result.decision, "classifier", result.reason
 
-    def before_tool(self, request: ToolRequest, context: ExecutionContext) -> None:
+    def before_tool(self, request: ToolRequest, context: ExecutionContext,
+                    hook_decision: HookDecision = HookDecision("allow")) -> None:
         started = time.monotonic()
         while not self._lock.acquire(timeout=0.05):
             context.check_cancelled()
         try:
             context.check_cancelled()
-            decision, source, reason = self._decide(request, context)
+            decision, source, reason = self._decide(request, context, hook_decision)
             context.check_cancelled()
             context.emit("permission_decision", decision=decision, source=source, reason=reason,
                          fingerprint=request.fingerprint, duration=time.monotonic() - started,
@@ -150,6 +157,7 @@ class PermissionHook:
                          human_fallback=self.human_fallback)
             context.check_cancelled()
             if decision != "allow":
-                raise ToolError("permission_denied", reason, {"source": source})
+                code = "hook_denied" if source == "hook" and hook_decision.decision == "deny" else "permission_denied"
+                raise ToolError(code, reason, {"source": source})
         finally:
             self._lock.release()
