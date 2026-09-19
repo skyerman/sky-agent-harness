@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sky-agent-harness"
+version = "0.1.0"
+description = "A minimal Python coding agent loop"
+requires-python = ">=3.11"
+dependencies = ["openai>=1.30,<3", "jsonschema>=4.18,<5", "regex>=2024.5.15"]
+
+[project.scripts]
+sky-agent = "sky_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
