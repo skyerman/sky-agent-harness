@@ -13,11 +13,14 @@ class PersistenceError(RuntimeError):
 
 class RunStore:
     def __init__(self, workspace: Path):
+        from .todos import TodoStore
+
         self.session_id = uuid4().hex
         self.directory = workspace / ".sky-agent" / "runs" / self.session_id
         self.artifacts = self.directory / "artifacts"
         self.artifacts.mkdir(parents=True)
         self._lock = threading.Lock()
+        self.todos = TodoStore(self)
 
     def record(self, kind: str, **data) -> dict:
         event = {"kind": kind, "session_id": self.session_id,
@@ -56,6 +59,9 @@ class RunStore:
 
 
 def inspect_run(directory: Path) -> dict:
+    from .execution import ToolError
+    from .todos import replay_update, summarize
+
     events = []
     lines = (directory / "events.jsonl").read_bytes().splitlines(keepends=True)
     incomplete_tail = False
@@ -74,6 +80,8 @@ def inspect_run(directory: Path) -> dict:
     messages = []
     hooks = []
     cleanup_errors = []
+    todos = {"revision": 0, "todos": []}
+    todo_history = []
     status = "unknown"
     for index, event in enumerate(events):
         try:
@@ -96,8 +104,12 @@ def inspect_run(directory: Path) -> dict:
                 cleanup_errors = event.get("cleanup_errors", [])
             elif event["kind"] in {"hook_started", "hook_finished", "hook_failed"}:
                 hooks.append(event)
-        except (KeyError, TypeError, ValueError) as exc:
+            elif event["kind"] == "todo_updated":
+                todos = replay_update(todos, event)
+                todo_history.append(event)
+        except (KeyError, TypeError, ValueError, ToolError) as exc:
             raise ValueError(f"Invalid journal record at line {index + 1}: {exc}") from exc
     return {"directory": str(directory.resolve()), "status": status,
             "incomplete_tail": incomplete_tail, "calls": calls, "messages": messages,
-            "hooks": hooks, "cleanup_errors": cleanup_errors}
+            "hooks": hooks, "cleanup_errors": cleanup_errors,
+            "todos": todos, "todo_history": todo_history, "todo_summary": summarize(todos)}

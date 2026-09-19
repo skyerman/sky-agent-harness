@@ -48,7 +48,8 @@ class RunLifecycle:
             try:
                 context.emit("session_finished", status=status,
                              error=type(error).__name__ if error is not None else None,
-                             cleanup_errors=[type(exc).__name__ for exc in failures])
+                             cleanup_errors=[type(exc).__name__ for exc in failures],
+                             todo_summary=context.store.todos.summary())
             except BaseException as exc:
                 failures.append(exc)
             if failures:

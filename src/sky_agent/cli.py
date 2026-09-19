@@ -37,6 +37,24 @@ def progress(event):
         print(f"\n[{event['tool_call_id']}] {event['status']} ({event['duration']:.2f}s)", file=sys.stderr, flush=True)
     elif kind == "permission_decision":
         print(f"[{event['tool_call_id']}] permission: {event['decision']} ({event['source']})", file=sys.stderr, flush=True)
+    elif kind == "todo_updated":
+        items = event["todos"]
+        completed = sum(item["status"] == "completed" for item in items)
+        print(f"Plan r{event['revision']}: {completed}/{len(items)} completed", file=sys.stderr, flush=True)
+        for item in items:
+            content = terminal_text(item["content"])
+            reason = " - " + terminal_text(item["reason"]) if item.get("reason") else ""
+            print(f"  [{item['status']}] {item['id']}: {content}{reason}", file=sys.stderr, flush=True)
+    elif kind == "session_finished" and event.get("todo_summary", {}).get("revision"):
+        summary = event["todo_summary"]
+        print(f"Plan saved: {len(summary['unfinished_ids'])} unfinished ({event['status']})",
+              file=sys.stderr, flush=True)
+
+
+def terminal_text(text):
+    # Keep non-ASCII descriptions readable while escaping terminal controls.
+    quoted = json.dumps(text, ensure_ascii=False)
+    return "".join(char if char.isprintable() else ascii(char)[1:-1] for char in quoted)
 
 
 def main(argv=None) -> int:

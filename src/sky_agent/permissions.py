@@ -89,7 +89,8 @@ class PermissionHook:
         policy = self.policy
         if request.tool_name in policy.denied:
             return "deny", "deny_rule", "Tool is explicitly denied"
-        if (policy.read_only or policy.mode == "readOnly") and not request.read_only:
+        session_state = request.permission_category == "session_state"
+        if (policy.read_only or policy.mode == "readOnly") and not request.read_only and not session_state:
             return "deny", "read_only", "Read-only policy denies this tool"
         if hook_decision.decision == "deny":
             return "deny", "hook", hook_decision.reason or "Hook denied this tool"
@@ -101,6 +102,8 @@ class PermissionHook:
             return self._ask(request, context, source, reason)
         if request.tool_name in policy.allowed:
             return "allow", "allow_rule", "Tool is explicitly allowed"
+        if session_state:
+            return "allow", "session_state", "Trusted session metadata update"
         if policy.mode == "allow":
             return "allow", "allow_mode", "Legacy allow mode"
         if policy.mode == "readOnly" or policy.read_only:

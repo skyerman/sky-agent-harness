@@ -107,6 +107,16 @@ class Agent:
             )},
             {"role": "user", "content": task},
         ]
+        if {"todo_read", "todo_write"} <= self.tools.keys():
+            messages[0]["content"] += (
+                " For multi-step work, maintain a concise plan with todo_read/todo_write; "
+                "simple questions do not need a plan. Plans start empty at revision 0 in each run. "
+                "Preserve stable item IDs and submit the entire list with expected_revision. "
+                "After a revision conflict read the current plan before updating. Keep at most one "
+                "item in_progress. Explain blocked/cancelled work and removal of unfinished items. "
+                "Mark completed only when the work is done; describe actual verification results "
+                "and unresolved work honestly. Plan status is not proof that commands succeeded."
+            )
         for message in messages:
             context.store.record("message", message=message)
         runner = ToolRunner(list(self.tools.values()), context, max_parallel=self.max_parallel,

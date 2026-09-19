@@ -33,7 +33,7 @@ class Tool:
     permission_category: str | None = None
 
     def __post_init__(self):
-        if self.permission_category not in {None, "read", "edit"}:
+        if self.permission_category not in {None, "read", "edit", "session_state"}:
             raise ValueError("Invalid tool permission category")
         Draft202012Validator.check_schema(self.parameters)
         self._validator = Draft202012Validator(self.parameters)
@@ -98,6 +98,8 @@ def file_hash(data: bytes) -> str:
 
 
 def workspace_tools(workspace: Path, *, command_timeout: float = 30) -> list[Tool]:
+    from .todos import todo_tools
+
     root = workspace.resolve(strict=True)
     if not root.is_dir():
         raise ValueError("Workspace must be a directory")
@@ -326,6 +328,7 @@ def workspace_tools(workspace: Path, *, command_timeout: float = 30) -> list[Too
              {"artifact_id": path_schema, "offset": {"type": "integer", "minimum": 0},
               "limit": {"type": "integer", "minimum": 1, "maximum": TEXT_LIMIT}},
              read_artifact, ["artifact_id"], read_only=True, contextual=True, validator=None, permission_category="read"),
+        *todo_tools(root),
         tool("run_command", "Run argv without an implicit shell, in workspace-relative cwd. Streams output to artifacts; failures include output details.",
              {"argv": {"type": "array", "minItems": 1, "maxItems": 256, "items": string},
               "cwd": path_schema, "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 3600}},
