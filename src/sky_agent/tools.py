@@ -30,8 +30,11 @@ class Tool:
     validator: Callable[..., None] | None = None
     contextual: bool = False
     workspace: Path | None = None
+    permission_category: str | None = None
 
     def __post_init__(self):
+        if self.permission_category not in {None, "read", "edit"}:
+            raise ValueError("Invalid tool permission category")
         Draft202012Validator.check_schema(self.parameters)
         self._validator = Draft202012Validator(self.parameters)
 
@@ -296,29 +299,33 @@ def workspace_tools(workspace: Path, *, command_timeout: float = 30) -> list[Too
     discovery = {"path": path_schema, "pattern": {"type": "string", "maxLength": 4096}, **paging}
     boolean = {"type": "boolean"}
 
-    def tool(name, description, properties, handler, required, *, read_only=False, contextual=False, validator=check_path):
-        return Tool(name, description, properties, handler, required, read_only, validator, contextual, root)
+    def tool(name, description, properties, handler, required, *, read_only=False, contextual=False,
+             validator=check_path, permission_category=None):
+        return Tool(name, description, properties, handler, required, read_only, validator, contextual,
+                    root, permission_category)
 
     return [
         tool("list_files", "List workspace files in stable order; use next_offset for more. Generated directories are skipped.",
-             {**discovery, "recursive": boolean}, list_files, [], read_only=True, contextual=True),
+             {**discovery, "recursive": boolean}, list_files, [], read_only=True, contextual=True, permission_category="read"),
         tool("search_text", "Find literal text or regex in UTF-8 files. Returns paths and 1-based lines; follow next_offset.",
              {**discovery, "query": {"type": "string", "minLength": 1, "maxLength": 4096}, "regex": boolean},
-             search_text, ["query"], read_only=True, contextual=True),
+             search_text, ["query"], read_only=True, contextual=True, permission_category="read"),
         tool("read_file", "Read UTF-8 text with its hash. Follow next.start_line/column for more; use hash when editing.",
              {"path": path_schema, "start_line": {"type": "integer", "minimum": 1},
               "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
-              "column": {"type": "integer", "minimum": 0}}, read_file, ["path"], read_only=True, validator=check_read),
+              "column": {"type": "integer", "minimum": 0}}, read_file, ["path"], read_only=True,
+             validator=check_read, permission_category="read"),
         tool("write_file", "Create a UTF-8 file. Replacing requires overwrite=true and the hash returned by read_file.",
              {"path": path_schema, "content": string, "overwrite": boolean, "expected_hash": digest},
-             write_file, ["path", "content"], validator=check_write),
+             write_file, ["path", "content"], validator=check_write, permission_category="edit"),
         tool("edit_file", "Replace an exact nonempty string after checking expected_hash. Multiple matches require replace_all=true.",
              {"path": path_schema, "old": {"type": "string", "minLength": 1}, "new": string,
-              "expected_hash": digest, "replace_all": boolean}, edit_file, ["path", "old", "new", "expected_hash"], validator=check_edit),
+              "expected_hash": digest, "replace_all": boolean}, edit_file, ["path", "old", "new", "expected_hash"],
+             validator=check_edit, permission_category="edit"),
         tool("read_artifact", "Read command output from an artifact_id returned by a tool in this session. Offsets count characters.",
              {"artifact_id": path_schema, "offset": {"type": "integer", "minimum": 0},
               "limit": {"type": "integer", "minimum": 1, "maximum": TEXT_LIMIT}},
-             read_artifact, ["artifact_id"], read_only=True, contextual=True, validator=None),
+             read_artifact, ["artifact_id"], read_only=True, contextual=True, validator=None, permission_category="read"),
         tool("run_command", "Run argv without an implicit shell, in workspace-relative cwd. Streams output to artifacts; failures include output details.",
              {"argv": {"type": "array", "minItems": 1, "maxItems": 256, "items": string},
               "cwd": path_schema, "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 3600}},

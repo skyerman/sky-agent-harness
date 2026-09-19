@@ -8,6 +8,8 @@ import unittest
 from unittest.mock import patch
 
 from sky_agent.cli import configuration, main
+from sky_agent.permissions import Classification
+from sky_agent.persistence import inspect_run
 
 
 class CliTests(unittest.TestCase):
@@ -51,4 +53,62 @@ class CliTests(unittest.TestCase):
         with patch("sky_agent.cli.OpenAIChatModel") as model, contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 main(["--max-parallel", "0", "task"])
+            model.assert_not_called()
+
+    def test_permission_modes_and_noninteractive_denial(self):
+        class WriteModel:
+            def __init__(self, *args, **kwargs):
+                pass
+            def complete(self, messages, tools):
+                if len(messages) == 2:
+                    return {"role": "assistant", "content": None, "tool_calls": [{
+                        "id": "write", "type": "function", "function": {
+                            "name": "write_file", "arguments": '{"path":"created","content":"text"}',
+                        },
+                    }]}
+                return {"role": "assistant", "content": "finished"}
+        for mode, exists in [("default", False), ("acceptEdits", True), ("readOnly", False)]:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as root, \
+                    patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test"}, clear=True), \
+                    patch("sky_agent.cli.OpenAIChatModel", WriteModel), patch("sys.stdin.isatty", return_value=False), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(main(["--workspace", root, "--permission-mode", mode, "task"]), 0)
+                self.assertEqual((Path(root) / "created").exists(), exists)
+
+    def test_auto_cli_uses_classifier_for_command(self):
+        import json
+        import sys
+        class CommandModel:
+            def __init__(self, *args, **kwargs):
+                self.client = object()
+            def complete(self, messages, tools):
+                if len(messages) == 2:
+                    return {"role": "assistant", "content": None, "tool_calls": [{
+                        "id": "command", "type": "function", "function": {
+                            "name": "run_command", "arguments": json.dumps({"argv": [sys.executable, "-c", "print(42)"]}),
+                        },
+                    }]}
+                return {"role": "assistant", "content": "finished"}
+        with tempfile.TemporaryDirectory() as root, \
+                patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test"}, clear=True), \
+                patch("sky_agent.cli.OpenAIChatModel", CommandModel), \
+                patch("sky_agent.cli.DeepSeekActionClassifier") as classifier, \
+                patch("sys.stdin.isatty", return_value=False), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            classifier.return_value.classify.return_value = Classification("allow", "Requested test")
+            self.assertEqual(main(["--workspace", root, "--permission-mode", "auto", "--classifier-model", "test-classifier", "task"]), 0)
+            classifier.return_value.classify.assert_called_once()
+            self.assertEqual(classifier.call_args.args[1], "test-classifier")
+            session = next((Path(root) / ".sky-agent" / "runs").iterdir())
+            call = inspect_run(session)["calls"]["1:command"]
+            self.assertEqual(call["permissions"][-1]["source"], "classifier")
+            self.assertEqual(call["result"]["result"]["stdout"].strip(), "42")
+
+    def test_invalid_permission_flags_fail_before_network(self):
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test"}, clear=True), \
+                patch("sky_agent.cli.OpenAIChatModel") as model, contextlib.redirect_stderr(io.StringIO()):
+            for args in [["--auto-denial-limit", "0"], ["--classifier-timeout", "nan"],
+                         ["--deny-tool", "missing"], ["--permission-mode", "missing"]]:
+                with self.subTest(args=args), self.assertRaises(SystemExit):
+                    main([*args, "task"])
             model.assert_not_called()

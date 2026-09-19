@@ -85,6 +85,8 @@ def inspect_run(directory: Path) -> dict:
                 calls[event["invocation_id"]]["artifacts"] = event["artifacts"]
             elif event["kind"] == "finished":
                 calls[event["invocation_id"]].update(status=event["status"], result=event["result"])
+            elif event["kind"] in {"permission_requested", "permission_classification", "permission_decision"}:
+                calls[event["invocation_id"]].setdefault("permissions", []).append(event)
             elif event["kind"] == "message":
                 messages.append(event["message"])
             elif event["kind"] == "session_finished":

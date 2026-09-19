@@ -4,8 +4,10 @@ import threading
 from typing import Any, Callable, Protocol
 
 from .execution import ExecutionContext, ToolError
+from .hooks import BeforeToolHook
+from .permissions import PermissionPolicy
 from .persistence import RunStore
-from .runtime import PermissionPolicy, ToolRunner
+from .runtime import ToolRunner
 from .tools import Tool
 from .workspace import WorkspaceLease
 
@@ -34,6 +36,7 @@ class Agent:
     def __init__(self, model: Model, tools: list[Tool], *, max_steps: int = 20,
                  workspace: Path | None = None, max_parallel: int = 4,
                  policy: PermissionPolicy | None = None,
+                 hooks: tuple[BeforeToolHook, ...] = (),
                  on_event: Callable[[dict], None] | None = None):
         if max_steps < 1:
             raise ValueError("max_steps must be positive")
@@ -54,6 +57,7 @@ class Agent:
             raise ValueError("Workspace must be a directory")
         self.max_parallel = max_parallel
         self.policy = policy
+        self.hooks = tuple(hooks)
         self.on_event = on_event
         self.last_session_directory: Path | None = None
 
@@ -92,7 +96,8 @@ class Agent:
         ]
         for message in messages:
             context.store.record("message", message=message)
-        runner = ToolRunner(list(self.tools.values()), context, max_parallel=self.max_parallel, policy=self.policy)
+        runner = ToolRunner(list(self.tools.values()), context, max_parallel=self.max_parallel,
+                            policy=self.policy, hooks=self.hooks)
         schemas = [tool.schema for tool in self.tools.values()]
         for step in range(1, self.max_steps + 1):
             context.check_cancelled()
@@ -103,7 +108,7 @@ class Agent:
             if not calls:
                 context.check_cancelled()
                 return AgentResult(response.get("content") or "", messages, step, context.store.directory)
-            for message in runner.run(calls, round_number=step):
+            for message in runner.run(calls, round_number=step, messages=messages):
                 messages.append(message)
                 context.store.record("message", message=message)
             context.check_cancelled()

@@ -1,10 +1,11 @@
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 import json
 import time
-from typing import Callable
 
 from .execution import ExecutionContext, ToolError
+from .hooks import BeforeToolHook, ToolRequest, conversation_snapshot
+from .permissions import PermissionPolicy
 from .persistence import PersistenceError
 from .tools import Tool
 
@@ -13,23 +14,9 @@ class ProtocolError(ValueError):
     pass
 
 
-@dataclass
-class PermissionPolicy:
-    read_only: bool = False
-    denied: set[str] = field(default_factory=set)
-    ask: set[str] = field(default_factory=set)
-    approve: Callable[[str, dict], bool] | None = None
-
-    def check(self, tool: Tool, arguments: dict):
-        if tool.name in self.denied or (self.read_only and not tool.read_only):
-            raise ToolError("permission_denied", f"Policy denies {tool.name}")
-        if tool.name in self.ask and (self.approve is None or not self.approve(tool.name, arguments)):
-            raise ToolError("permission_denied", f"Approval not granted for {tool.name}")
-
-
 class ToolRunner:
     def __init__(self, tools: list[Tool], context: ExecutionContext, *, max_parallel: int = 4,
-                 policy: PermissionPolicy | None = None):
+                 policy: PermissionPolicy | None = None, hooks: tuple[BeforeToolHook, ...] = ()):
         if not 1 <= max_parallel <= 32:
             raise ValueError("max_parallel must be between 1 and 32")
         self.tools = {tool.name: tool for tool in tools}
@@ -38,6 +25,29 @@ class ToolRunner:
         self.context = context
         self.max_parallel = max_parallel
         self.policy = policy or PermissionPolicy()
+        self.hooks = tuple(hooks)
+
+    @property
+    def policy(self):
+        return self._policy
+
+    @policy.setter
+    def policy(self, policy):
+        self._policy = policy
+        self._permission_hook = policy.new_session()
+
+    def before_tool(self, request, context):
+        for hook in (self._permission_hook, *self.hooks):
+            context.check_cancelled()
+            try:
+                if hook.before_tool(request, context) is not None:
+                    raise TypeError("Before-tool hooks must return None or raise ToolError")
+            except (ToolError, PersistenceError):
+                raise
+            except Exception as exc:
+                context.emit("hook_failed", hook=type(hook).__name__, error=type(exc).__name__,
+                             fingerprint=request.fingerprint)
+                raise ToolError("hook_failed", "A before-tool hook failed; execution denied") from exc
 
     def validate_calls(self, calls: list[dict]):
         if not isinstance(calls, list) or len(calls) > 128:
@@ -72,7 +82,7 @@ class ToolRunner:
         if pending:
             yield pending
 
-    def execute(self, call, round_number):
+    def execute(self, call, round_number, conversation_json='{"messages":[],"truncated":false}'):
         name = call["function"]["name"]
         context = replace(self.context, invocation_id=f"{round_number}:{call['id']}",
                           tool_call_id=call["id"], tool=name)
@@ -84,7 +94,8 @@ class ToolRunner:
             if tool is None:
                 raise ToolError("unknown_tool", f"Unknown tool: {name}")
             kwargs = tool.prepare(call["function"]["arguments"])
-            self.policy.check(tool, kwargs)
+            request = ToolRequest.create(tool, kwargs, conversation_json)
+            self.before_tool(request, context)
             result = tool.invoke(kwargs, context)
             json.dumps(result, allow_nan=False)
         except ToolError as exc:
@@ -103,18 +114,19 @@ class ToolRunner:
         return {"role": "tool", "tool_call_id": call["id"],
                 "content": json.dumps(result, ensure_ascii=False)}
 
-    def run(self, calls, *, round_number: int):
+    def run(self, calls, *, round_number: int, messages: list[dict] | None = None):
         self.validate_calls(calls)
-        messages = []
+        conversation_json = conversation_snapshot(messages or [])
+        results = []
         pool = ThreadPoolExecutor(max_workers=self.max_parallel)
         try:
             for batch in self.batches(calls):
                 if len(batch) == 1:
-                    messages.append(self.execute(batch[0], round_number))
+                    results.append(self.execute(batch[0], round_number, conversation_json))
                 else:
-                    futures = [pool.submit(self.execute, call, round_number) for call in batch]
-                    messages.extend(future.result() for future in futures)
-            return messages
+                    futures = [pool.submit(self.execute, call, round_number, conversation_json) for call in batch]
+                    results.extend(future.result() for future in futures)
+            return results
         except BaseException:
             self.context.cancel.set()
             raise
