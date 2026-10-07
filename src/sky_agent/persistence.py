@@ -12,11 +12,15 @@ class PersistenceError(RuntimeError):
 
 
 class RunStore:
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, *, parent=None, agent_id="root", parent_invocation_id=None):
         from .todos import TodoStore
 
         self.session_id = uuid4().hex
-        self.directory = workspace / ".sky-agent" / "runs" / self.session_id
+        self.directory = (parent.directory / "children" / self.session_id if parent else
+                          workspace / ".sky-agent" / "runs" / self.session_id)
+        self.agent_id = agent_id
+        self.parent_session_id = parent.session_id if parent else None
+        self.parent_invocation_id = parent_invocation_id
         self.artifacts = self.directory / "artifacts"
         self.artifacts.mkdir(parents=True)
         self._lock = threading.Lock()
@@ -24,7 +28,9 @@ class RunStore:
 
     def record(self, kind: str, **data) -> dict:
         event = {"kind": kind, "session_id": self.session_id,
-                 "timestamp": datetime.now(timezone.utc).isoformat(), **data}
+                 "timestamp": datetime.now(timezone.utc).isoformat(), "agent_id": self.agent_id,
+                 "parent_session_id": self.parent_session_id,
+                 "parent_invocation_id": self.parent_invocation_id, **data}
         try:
             with self._lock:
                 with (self.directory / "events.jsonl").open("a", encoding="utf-8") as file:
@@ -82,9 +88,14 @@ def inspect_run(directory: Path) -> dict:
     cleanup_errors = []
     todos = {"revision": 0, "todos": []}
     todo_history = []
+    subagents = {}
+    identity = {}
+    model_calls = 0
     status = "unknown"
     for index, event in enumerate(events):
         try:
+            if not identity:
+                identity = {key: event.get(key) for key in ("session_id", "agent_id", "parent_session_id", "parent_invocation_id")}
             if event["kind"] == "started":
                 if event["invocation_id"] in calls:
                     raise ValueError("Duplicate invocation")
@@ -107,9 +118,21 @@ def inspect_run(directory: Path) -> dict:
             elif event["kind"] == "todo_updated":
                 todos = replay_update(todos, event)
                 todo_history.append(event)
+            elif event["kind"] == "subagent_queued":
+                if event["agent_id"] in subagents:
+                    raise ValueError("Duplicate child identity")
+                subagents[event["agent_id"]] = {"name": event["name"], "profile": event["profile"],
+                                              "status": "queued", "parent_invocation_id": event["invocation_id"]}
+            elif event["kind"] in {"subagent_started", "subagent_finished"}:
+                subagents[event["agent_id"]].update(event)
+                if event["kind"] == "subagent_started":
+                    subagents[event["agent_id"]]["status"] = "running"
+            elif event["kind"] == "model_call_reserved" and event.get("purpose") == "model":
+                model_calls += 1
         except (KeyError, TypeError, ValueError, ToolError) as exc:
             raise ValueError(f"Invalid journal record at line {index + 1}: {exc}") from exc
     return {"directory": str(directory.resolve()), "status": status,
             "incomplete_tail": incomplete_tail, "calls": calls, "messages": messages,
             "hooks": hooks, "cleanup_errors": cleanup_errors,
-            "todos": todos, "todo_history": todo_history, "todo_summary": summarize(todos)}
+            "todos": todos, "todo_history": todo_history, "todo_summary": summarize(todos),
+            "identity": identity, "subagents": subagents, "model_calls": model_calls}

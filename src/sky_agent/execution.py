@@ -37,6 +37,9 @@ class ExecutionContext:
     tool_call_id: str = "direct"
     tool: str = ""
     event_lock: threading.RLock = field(default_factory=threading.RLock)
+    agent_id: str = "root"
+    parent_session_id: str | None = None
+    persistence_failed: threading.Event = field(default_factory=threading.Event)
 
     def check_cancelled(self):
         if self.cancel.is_set():
@@ -45,12 +48,14 @@ class ExecutionContext:
     def emit(self, kind: str, *, persist: bool = True, **data):
         with self.event_lock:
             event = {"invocation_id": self.invocation_id, "tool_call_id": self.tool_call_id,
-                     "tool": self.tool, **data}
+                     "tool": self.tool, "agent_id": self.agent_id,
+                     "parent_session_id": self.parent_session_id, **data}
             if persist:
                 try:
                     event = self.store.record(kind, **event)
                 except PersistenceError:
                     self.cancel.set()
+                    self.persistence_failed.set()
                     raise
             else:
                 event.update(kind=kind, session_id=self.store.session_id,
@@ -59,7 +64,12 @@ class ExecutionContext:
                 try:
                     self.callback(event)
                 except Exception as exc:
-                    self.store.record("observer_error", message=str(exc))
+                    try:
+                        self.store.record("observer_error", message=str(exc))
+                    except PersistenceError:
+                        self.cancel.set()
+                        self.persistence_failed.set()
+                        raise
 
 
 class ProcessTree:

@@ -13,6 +13,7 @@ from .execution import ToolError
 from .persistence import inspect_run
 from .permissions import PERMISSION_MODES, PermissionPolicy
 from .tools import workspace_tools
+from .subagents import SubagentConfig
 
 
 def configuration(args) -> tuple[str | None, str | None, str | None]:
@@ -26,6 +27,8 @@ def configuration(args) -> tuple[str | None, str | None, str | None]:
 
 
 def progress(event):
+    if event.get("agent_id", "root") != "root" and event["kind"] not in {"subagent_started", "subagent_finished"}:
+        event = dict(event, tool_call_id=f"{event['agent_id'][:8]}:{event['tool_call_id']}")
     kind = event["kind"]
     if kind == "session_started":
         print(f"Session: {event['directory']}", file=sys.stderr, flush=True)
@@ -49,6 +52,10 @@ def progress(event):
         summary = event["todo_summary"]
         print(f"Plan saved: {len(summary['unfinished_ids'])} unfinished ({event['status']})",
               file=sys.stderr, flush=True)
+    elif kind == "subagent_started":
+        print(f"Subagent {event['agent_id'][:8]} {terminal_text(event['name'])} started", file=sys.stderr, flush=True)
+    elif kind == "subagent_finished":
+        print(f"Subagent {event['agent_id'][:8]} {terminal_text(event['name'])}: {event['status']}", file=sys.stderr, flush=True)
 
 
 def terminal_text(text):
@@ -65,6 +72,11 @@ def main(argv=None) -> int:
     parser.add_argument("--base-url")
     parser.add_argument("--max-steps", type=int, default=20)
     parser.add_argument("--max-parallel", type=int, default=4)
+    parser.add_argument("--no-subagents", action="store_true")
+    parser.add_argument("--subagent-parallel", type=int, default=2)
+    parser.add_argument("--subagent-max-steps", type=int, default=8)
+    parser.add_argument("--subagent-max-total", type=int, default=8)
+    parser.add_argument("--max-model-calls", type=int, default=60)
     parser.add_argument("--command-timeout", type=float, default=30)
     parser.add_argument("--read-only", action="store_true")
     parser.add_argument("--permission-mode", choices=PERMISSION_MODES, default="allow")
@@ -90,6 +102,13 @@ def main(argv=None) -> int:
         parser.error("Require max-steps > 0, max-parallel in [1,32], and command-timeout in (0,3600]")
     if args.auto_denial_limit < 1 or not math.isfinite(args.classifier_timeout) or not 0 < args.classifier_timeout <= 120:
         parser.error("Require auto-denial-limit > 0 and classifier-timeout in (0,120]")
+    try:
+        subagent_config = SubagentConfig(max_parallel=args.subagent_parallel, max_steps=args.subagent_max_steps,
+                                        max_total=args.subagent_max_total)
+        if not 1 <= args.max_model_calls <= 10000:
+            raise ValueError("max-model-calls must be in [1,10000]")
+    except ValueError as exc:
+        parser.error(str(exc))
     api_key, model_name, base_url = configuration(args)
     if not model_name:
         parser.error("Set OPENAI_MODEL or pass --model")
@@ -98,7 +117,8 @@ def main(argv=None) -> int:
     agent = None
     try:
         tools = workspace_tools(args.workspace, command_timeout=args.command_timeout)
-        unknown = (set(args.deny_tool) | set(args.ask_tool) | set(args.allow_tool)) - {tool.name for tool in tools}
+        tool_names = {tool.name for tool in tools} | ({"run_subagents"} if not args.no_subagents else set())
+        unknown = (set(args.deny_tool) | set(args.ask_tool) | set(args.allow_tool)) - tool_names
         if unknown:
             parser.error(f"Unknown tool in permission rules: {', '.join(sorted(unknown))}")
         model = OpenAIChatModel(model_name, api_key=api_key, base_url=base_url)
@@ -110,6 +130,9 @@ def main(argv=None) -> int:
                                   human_approve=TerminalApproval())
         agent = Agent(model, tools, max_steps=args.max_steps, workspace=args.workspace,
                       max_parallel=args.max_parallel, policy=policy,
+                      model_factory=None if args.no_subagents else lambda: OpenAIChatModel(
+                          model_name, api_key=api_key, base_url=base_url),
+                      subagent_config=subagent_config, max_model_calls=args.max_model_calls,
                       on_event=None if args.quiet else progress)
         result = agent.run(args.task)
     except StepLimitExceeded as exc:

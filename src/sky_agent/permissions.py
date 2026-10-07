@@ -52,18 +52,19 @@ class PermissionPolicy:
         if type(self.rejection_threshold) is not int or self.rejection_threshold < 1:
             raise ValueError("rejection_threshold must be a positive integer")
 
-    def new_session(self):
-        return PermissionHook(self)
+    def new_session(self, *, budget=None):
+        return PermissionHook(self, budget=budget)
 
 
 class PermissionHook:
     """Per-run permission state. The tool runtime owns this hook, not the loop."""
 
-    def __init__(self, policy: PermissionPolicy):
+    def __init__(self, policy: PermissionPolicy, *, budget=None):
         self.policy = policy
         self.consecutive_denials = 0
         self.human_fallback = False
         self._lock = threading.Lock()
+        self.budget = budget
 
     def _ask(self, request, context, source, reason):
         context.check_cancelled()
@@ -89,7 +90,7 @@ class PermissionHook:
         policy = self.policy
         if request.tool_name in policy.denied:
             return "deny", "deny_rule", "Tool is explicitly denied"
-        session_state = request.permission_category == "session_state"
+        session_state = request.permission_category in {"session_state", "delegation"}
         if (policy.read_only or policy.mode == "readOnly") and not request.read_only and not session_state:
             return "deny", "read_only", "Read-only policy denies this tool"
         if hook_decision.decision == "deny":
@@ -103,7 +104,7 @@ class PermissionHook:
         if request.tool_name in policy.allowed:
             return "allow", "allow_rule", "Tool is explicitly allowed"
         if session_state:
-            return "allow", "session_state", "Trusted session metadata update"
+            return "allow", request.permission_category, "Trusted session operation; inner tools retain permission checks"
         if policy.mode == "allow":
             return "allow", "allow_mode", "Legacy allow mode"
         if policy.mode == "readOnly" or policy.read_only:
@@ -121,6 +122,8 @@ class PermissionHook:
         started = time.monotonic()
         try:
             context.check_cancelled()
+            if self.budget:
+                self.budget.reserve(context, "classifier")
             result = policy.classifier.classify(request)
             if not isinstance(result, Classification):
                 raise ValueError("Classifier did not return a Classification")

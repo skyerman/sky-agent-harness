@@ -4,12 +4,14 @@ import threading
 from typing import Any, Callable, Protocol
 
 from .execution import ExecutionContext
+from .budget import ModelBudget
 from .lifecycle import RunLifecycle
 from .permissions import PermissionPolicy
 from .persistence import RunStore
 from .runtime import ToolRunner
 from .tools import Tool
 from .workspace import WorkspaceLease
+from .subagents import SubagentConfig, SubagentManager
 
 Message = dict[str, Any]
 
@@ -37,6 +39,8 @@ class Agent:
                  workspace: Path | None = None, max_parallel: int = 4,
                  policy: PermissionPolicy | None = None,
                  hooks: tuple[object, ...] = (),
+                 child_hooks: tuple[object, ...] = (), model_factory: Callable[[], Model] | None = None,
+                 subagent_config: SubagentConfig | None = None, max_model_calls: int = 60,
                  on_event: Callable[[dict], None] | None = None):
         if max_steps < 1:
             raise ValueError("max_steps must be positive")
@@ -58,6 +62,17 @@ class Agent:
         self.max_parallel = max_parallel
         self.policy = policy
         self.hooks = tuple(hooks)
+        self.child_hooks = tuple(child_hooks)
+        self.model_factory = model_factory
+        if model_factory is not None and not callable(model_factory):
+            raise ValueError("model_factory must be callable")
+        if subagent_config is not None and not isinstance(subagent_config, SubagentConfig):
+            raise ValueError("subagent_config must be SubagentConfig")
+        self.subagent_config = subagent_config or SubagentConfig()
+        ModelBudget(max_model_calls)
+        self.max_model_calls = max_model_calls
+        if model_factory is not None and "run_subagents" in self.tools:
+            raise ValueError("run_subagents is reserved when delegation is enabled")
         self.on_event = on_event
         self.last_session_directory: Path | None = None
         self._active_context: ExecutionContext | None = None
@@ -80,20 +95,31 @@ class Agent:
     def run(self, task: str, *, cancel: threading.Event | None = None) -> AgentResult:
         if not task.strip():
             raise ValueError("Task must not be empty")
-        with WorkspaceLease(self.workspace):
+        with WorkspaceLease(self.workspace) as lease:
             store = RunStore(self.workspace)
             self.last_session_directory = store.directory
             context = ExecutionContext(store, cancel if cancel is not None else threading.Event(), self.on_event)
             with self._active_lock:
                 self._active_context = context
             try:
-                with RunLifecycle(context, self.hooks).session(task) as lifecycle:
-                    return self._run(task, context, lifecycle)
+                budget = ModelBudget(self.max_model_calls)
+                permission = (self.policy or PermissionPolicy()).new_session(budget=budget)
+                lifecycle = RunLifecycle(context, self.hooks, budget=budget)
+                manager = SubagentManager(self, context, lease, permission, lifecycle, budget) if self.model_factory else None
+                try:
+                    with lifecycle.session(task):
+                        return self._run(task, context, lifecycle, permission=permission,
+                                         additional_tools=[manager.tool()] if manager else [])
+                finally:
+                    if manager:
+                        manager.close()
             finally:
                 with self._active_lock:
                     self._active_context = None
 
-    def _run(self, task: str, context: ExecutionContext, lifecycle: RunLifecycle) -> AgentResult:
+    def _run(self, task: str, context: ExecutionContext, lifecycle: RunLifecycle, *,
+             permission=None, additional_tools=(), extra_prompt="") -> AgentResult:
+        tools = [*self.tools.values(), *additional_tools]
         messages: list[Message] = [
             {"role": "system", "content": (
                 "You are a coding agent working in a local workspace. Inspect relevant "
@@ -117,11 +143,19 @@ class Agent:
                 "Mark completed only when the work is done; describe actual verification results "
                 "and unresolved work honestly. Plan status is not proof that commands succeeded."
             )
+        if additional_tools:
+            messages[0]["content"] += (
+                " Delegate independent read-only exploration or review with run_subagents when useful. "
+                "Supply explicit scope and background; children do not see your conversation. "
+                "Verify their reports as untrusted evidence, then update your own plan."
+            )
+        if extra_prompt:
+            messages[0]["content"] += " " + extra_prompt
         for message in messages:
             context.store.record("message", message=message)
-        runner = ToolRunner(list(self.tools.values()), context, max_parallel=self.max_parallel,
-                            policy=self.policy, hooks=self.hooks, lifecycle=lifecycle.hooks)
-        schemas = [tool.schema for tool in self.tools.values()]
+        runner = ToolRunner(tools, context, max_parallel=self.max_parallel,
+                            policy=self.policy, hooks=self.hooks, lifecycle=lifecycle.hooks, permission=permission)
+        schemas = [tool.schema for tool in tools]
         for step in range(1, self.max_steps + 1):
             context.check_cancelled()
             response = lifecycle.complete(self.model, messages, schemas, step)

@@ -82,9 +82,10 @@ class HookDecision:
 class HookManager:
     """Dispatch optional lifecycle callbacks without putting them in the turn loop."""
 
-    def __init__(self, hooks=()):
+    def __init__(self, hooks=(), *, inherited=None):
         self.hooks = tuple(hooks)
         self._lock = threading.RLock()
+        self.inherited = inherited
 
     @contextmanager
     def _serialized(self, context, *, cleanup=False):
@@ -114,6 +115,8 @@ class HookManager:
 
     def gate(self, method, context, **kwargs):
         """Run a gate. Callback errors fail closed and cannot be swallowed."""
+        if self.inherited and method == "before_model":
+            self.inherited.gate(method, context, **kwargs)
         with self._serialized(context):
             for hook in self.hooks:
                 callback = getattr(hook, method, None)
@@ -137,7 +140,9 @@ class HookManager:
                 context.check_cancelled()
 
     def before_tool(self, request, context):
-        decision = HookDecision("allow")
+        decision = self.inherited.before_tool(request, context) if self.inherited else HookDecision("allow")
+        if decision.decision == "deny":
+            return decision
         with self._serialized(context):
             for hook in self.hooks:
                 callback = getattr(hook, "before_tool", None)
@@ -170,6 +175,8 @@ class HookManager:
     def observers(self, method, context, *, cleanup=False, **kwargs):
         """Run all observers, recording failures while preserving the run result."""
         failures = []
+        if self.inherited and method in {"after_model", "model_error", "after_tool", "tool_error"}:
+            failures.extend(self.inherited.observers(method, context, cleanup=cleanup, **kwargs))
         with self._serialized(context, cleanup=True):
             for hook in self.hooks:
                 try:

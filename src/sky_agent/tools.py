@@ -33,7 +33,7 @@ class Tool:
     permission_category: str | None = None
 
     def __post_init__(self):
-        if self.permission_category not in {None, "read", "edit", "session_state"}:
+        if self.permission_category not in {None, "read", "edit", "session_state", "delegation"}:
             raise ValueError("Invalid tool permission category")
         Draft202012Validator.check_schema(self.parameters)
         self._validator = Draft202012Validator(self.parameters)

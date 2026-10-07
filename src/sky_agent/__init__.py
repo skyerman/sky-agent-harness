@@ -2,5 +2,6 @@
 
 from .agent import Agent, AgentResult, StepLimitExceeded
 from .hooks import HookDecision
+from .subagents import SubagentConfig
 
-__all__ = ["Agent", "AgentResult", "StepLimitExceeded", "HookDecision"]
+__all__ = ["Agent", "AgentResult", "StepLimitExceeded", "HookDecision", "SubagentConfig"]

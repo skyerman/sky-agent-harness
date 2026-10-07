@@ -7,8 +7,11 @@ class OpenAIChatModel:
     def __init__(self, model: str, *, api_key: str, base_url: str | None = None):
         from openai import OpenAI
 
-        self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=60, max_retries=2)
+        self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=60, max_retries=0)
         self.model = model
+
+    def close(self):
+        self.client.close()
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict]) -> dict:
         kwargs: dict[str, Any] = {"model": self.model, "messages": messages}

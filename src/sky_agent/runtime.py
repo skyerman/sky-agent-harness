@@ -17,7 +17,7 @@ class ProtocolError(ValueError):
 class ToolRunner:
     def __init__(self, tools: list[Tool], context: ExecutionContext, *, max_parallel: int = 4,
                  policy: PermissionPolicy | None = None, hooks: tuple[object, ...] = (),
-                 lifecycle: HookManager | None = None):
+                 lifecycle: HookManager | None = None, permission=None):
         if not 1 <= max_parallel <= 32:
             raise ValueError("max_parallel must be between 1 and 32")
         self.tools = {tool.name: tool for tool in tools}
@@ -26,6 +26,8 @@ class ToolRunner:
         self.context = context
         self.max_parallel = max_parallel
         self.policy = policy or PermissionPolicy()
+        if permission is not None:
+            self._permission_hook = permission
         self.hooks = tuple(hooks)
         self.lifecycle = lifecycle or HookManager(self.hooks)
 
