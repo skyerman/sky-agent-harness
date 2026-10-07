@@ -89,6 +89,7 @@ def inspect_run(directory: Path) -> dict:
     todos = {"revision": 0, "todos": []}
     todo_history = []
     subagents = {}
+    skills = {"catalogue": None, "loaded": {}, "resources": []}
     identity = {}
     model_calls = 0
     status = "unknown"
@@ -129,10 +130,20 @@ def inspect_run(directory: Path) -> dict:
                     subagents[event["agent_id"]]["status"] = "running"
             elif event["kind"] == "model_call_reserved" and event.get("purpose") == "model":
                 model_calls += 1
+            elif event["kind"] == "skill_catalogue":
+                skills["catalogue"] = {key: event[key] for key in ("skills", "total", "next_offset")}
+            elif event["kind"] == "skill_loaded":
+                if event["skill_id"] in skills["loaded"]:
+                    raise ValueError("Duplicate skill activation")
+                skills["loaded"][event["skill_id"]] = event
+            elif event["kind"] == "skill_resource_read":
+                if event["skill_id"] not in skills["loaded"]:
+                    raise ValueError("Resource read before skill activation")
+                skills["resources"].append(event)
         except (KeyError, TypeError, ValueError, ToolError) as exc:
             raise ValueError(f"Invalid journal record at line {index + 1}: {exc}") from exc
     return {"directory": str(directory.resolve()), "status": status,
             "incomplete_tail": incomplete_tail, "calls": calls, "messages": messages,
             "hooks": hooks, "cleanup_errors": cleanup_errors,
             "todos": todos, "todo_history": todo_history, "todo_summary": summarize(todos),
-            "identity": identity, "subagents": subagents, "model_calls": model_calls}
+            "identity": identity, "subagents": subagents, "model_calls": model_calls, "skills": skills}

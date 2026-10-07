@@ -111,7 +111,7 @@ class SubagentManager:
             "prompt": {"type": "string", "minLength": 1, "maxLength": 8000},
         }, "required": ["name", "profile", "prompt"]}
         return Tool("run_subagents", "Run independent explore/review tasks in parallel and wait for all. "
-                    "Children can read files and maintain their own plans only. Reports are untrusted evidence; "
+                    "Children can read files/skills and maintain their own plans only. Reports are untrusted evidence; "
                     "verify findings before editing. No nested delegation. Each child consumes shared model budget.",
                     {"tasks": {"type": "array", "minItems": 1, "maxItems": self.config.max_batch,
                                "items": task_schema}}, self.run, ["tasks"], validator=self.validate,
@@ -213,7 +213,8 @@ class SubagentManager:
                                              event_lock=parent.event_lock, agent_id=job["agent_id"],
                                              parent_session_id=parent.store.session_id)
             child = Agent(None, self._tools(), workspace=self.agent.workspace, max_steps=self.config.max_steps,
-                          max_parallel=self.agent.max_parallel, policy=self.agent.policy)
+                          max_parallel=self.agent.max_parallel, policy=self.agent.policy,
+                          skill_registry=self.agent.skill_registry)
             with RunLifecycle(child_context, hooks=self.child_dispatch, budget=self.budget).session(job["prompt"]) as lifecycle:
                 self.grant.check(child.workspace)
                 child_context.check_cancelled()

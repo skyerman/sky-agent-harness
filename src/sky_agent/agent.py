@@ -12,6 +12,7 @@ from .runtime import ToolRunner
 from .tools import Tool
 from .workspace import WorkspaceLease
 from .subagents import SubagentConfig, SubagentManager
+from .skills import SkillRegistry, SkillSession, TOOL_NAMES as SKILL_TOOL_NAMES
 
 Message = dict[str, Any]
 
@@ -41,6 +42,7 @@ class Agent:
                  hooks: tuple[object, ...] = (),
                  child_hooks: tuple[object, ...] = (), model_factory: Callable[[], Model] | None = None,
                  subagent_config: SubagentConfig | None = None, max_model_calls: int = 60,
+                 skill_registry: SkillRegistry | None = None,
                  on_event: Callable[[dict], None] | None = None):
         if max_steps < 1:
             raise ValueError("max_steps must be positive")
@@ -48,6 +50,12 @@ class Agent:
         self.tools = {tool.name: tool for tool in tools}
         if len(self.tools) != len(tools):
             raise ValueError("Tool names must be unique")
+        if skill_registry is not None:
+            if not isinstance(skill_registry, SkillRegistry):
+                raise ValueError("skill_registry must be SkillRegistry")
+            if SKILL_TOOL_NAMES & self.tools.keys():
+                raise ValueError("Skill tool names are reserved when skills are enabled")
+        self.skill_registry = skill_registry
         self.max_steps = max_steps
         if not 1 <= max_parallel <= 32:
             raise ValueError("max_parallel must be between 1 and 32")
@@ -120,6 +128,9 @@ class Agent:
     def _run(self, task: str, context: ExecutionContext, lifecycle: RunLifecycle, *,
              permission=None, additional_tools=(), extra_prompt="") -> AgentResult:
         tools = [*self.tools.values(), *additional_tools]
+        skills = SkillSession(self.skill_registry) if self.skill_registry is not None else None
+        if skills:
+            tools.extend(skills.tools(self.workspace))
         messages: list[Message] = [
             {"role": "system", "content": (
                 "You are a coding agent working in a local workspace. Inspect relevant "
@@ -151,6 +162,8 @@ class Agent:
             )
         if extra_prompt:
             messages[0]["content"] += " " + extra_prompt
+        if skills:
+            messages[0]["content"] += skills.prompt(context)
         for message in messages:
             context.store.record("message", message=message)
         runner = ToolRunner(tools, context, max_parallel=self.max_parallel,

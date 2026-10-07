@@ -14,6 +14,28 @@ from .persistence import inspect_run
 from .permissions import PERMISSION_MODES, PermissionPolicy
 from .tools import workspace_tools
 from .subagents import SubagentConfig
+from .skills import SkillRegistry, TOOL_NAMES as SKILL_TOOL_NAMES
+
+
+def configured_skills(workspace, extra_roots, disabled=False):
+    if disabled:
+        if extra_roots:
+            raise ValueError("--no-skills cannot be combined with --skill-root")
+        return None
+    workspace = workspace.resolve(strict=True)
+    roots = {}
+    default = workspace / ".skills"
+    if default.exists() or default.is_symlink():
+        roots["project"] = default
+    for setting in extra_roots:
+        source, separator, location = setting.partition("=")
+        if not separator or not location.strip():
+            raise ValueError("--skill-root must be SOURCE=PATH")
+        if source == "project" or source in roots:
+            raise ValueError("Skill source names must be unique; project is reserved")
+        path = Path(location)
+        roots[source] = path if path.is_absolute() else workspace / path
+    return SkillRegistry(roots)
 
 
 def configuration(args) -> tuple[str | None, str | None, str | None]:
@@ -56,6 +78,8 @@ def progress(event):
         print(f"Subagent {event['agent_id'][:8]} {terminal_text(event['name'])} started", file=sys.stderr, flush=True)
     elif kind == "subagent_finished":
         print(f"Subagent {event['agent_id'][:8]} {terminal_text(event['name'])}: {event['status']}", file=sys.stderr, flush=True)
+    elif kind == "skill_loaded":
+        print(f"Skill {terminal_text(event['skill_id'])} loaded", file=sys.stderr, flush=True)
 
 
 def terminal_text(text):
@@ -77,6 +101,9 @@ def main(argv=None) -> int:
     parser.add_argument("--subagent-max-steps", type=int, default=8)
     parser.add_argument("--subagent-max-total", type=int, default=8)
     parser.add_argument("--max-model-calls", type=int, default=60)
+    parser.add_argument("--skill-root", action="append", default=[], metavar="SOURCE=PATH",
+                        help="Add a named local skill root; relative paths use workspace. Default: .skills as project")
+    parser.add_argument("--no-skills", action="store_true", help="Disable local skill discovery and tools")
     parser.add_argument("--command-timeout", type=float, default=30)
     parser.add_argument("--read-only", action="store_true")
     parser.add_argument("--permission-mode", choices=PERMISSION_MODES, default="allow")
@@ -117,7 +144,10 @@ def main(argv=None) -> int:
     agent = None
     try:
         tools = workspace_tools(args.workspace, command_timeout=args.command_timeout)
+        skill_registry = configured_skills(args.workspace, args.skill_root, args.no_skills)
         tool_names = {tool.name for tool in tools} | ({"run_subagents"} if not args.no_subagents else set())
+        if skill_registry is not None:
+            tool_names |= SKILL_TOOL_NAMES
         unknown = (set(args.deny_tool) | set(args.ask_tool) | set(args.allow_tool)) - tool_names
         if unknown:
             parser.error(f"Unknown tool in permission rules: {', '.join(sorted(unknown))}")
@@ -133,6 +163,7 @@ def main(argv=None) -> int:
                       model_factory=None if args.no_subagents else lambda: OpenAIChatModel(
                           model_name, api_key=api_key, base_url=base_url),
                       subagent_config=subagent_config, max_model_calls=args.max_model_calls,
+                      skill_registry=skill_registry,
                       on_event=None if args.quiet else progress)
         result = agent.run(args.task)
     except StepLimitExceeded as exc:
